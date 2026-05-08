@@ -250,51 +250,96 @@ OpenClaw fork already has special-case handling for the `codex` agent ID in `ext
 
 ### Agent: `pi` → `npx pi-acp`
 
-**Status: DOES NOT WORK with Ollama.** Wrong product.
+**Status: WORKS.** PONG received end-to-end via Ollama. **Fastest of the three** (5.5s).
 
-Env: tried with no overrides.
+**Correction:** the previous version of this section incorrectly identified `pi-acp` as Inflection's Pi consumer assistant. That was wrong. The actual product is:
 
-Result: `ok: false`, `durationMs: 1807`, error: `Authentication required: Configure an API key or log in with an OAuth provider.`
+- `pi-acp` (https://github.com/svkozak/pi-acp) — a thin ACP stdio adapter
+- wrapping `pi` (https://github.com/badlogic/pi-mono, npm `@mariozechner/pi-coding-agent`) — a small open-source terminal coding agent by Mario Zechner with read/edit/bash/write tools, structured diffs, and skills
+- That `pi-acp` package shells out to `pi --mode rpc` once `pi` is on PATH
 
-The `pi-acp` npm package is **not** OpenClaw's embedded PI runtime — it is a separate product (Inflection's Pi assistant) that requires its own API key or OAuth. It cannot be redirected to Ollama or any other model backend.
+`pi` supports many providers (Anthropic, OpenAI, DeepSeek, Gemini, Bedrock, Mistral, Groq, OpenRouter, xAI, Hugging Face, Fireworks, **Ollama / any OpenAI-compatible endpoint**) via a `~/.pi/agent/models.json` config file.
 
-The acpx alias `pi → npx pi-acp` exists for the original Pi product. If you want "OpenClaw's own runtime served as an ACP harness" instead, the right alias is `openclaw → openclaw acp` — that loops back to the local OpenClaw gateway and inherits whichever models the gateway is configured to use (already Ollama in this setup, no extra config). Untested in this round but logically the cleaner OpenClaw-native path.
+Setup steps required (one-time per VPS):
 
-### Recommendation
+```bash
+npm install -g @mariozechner/pi-coding-agent
+mkdir -p ~/.pi/agent
+```
 
-For new ACP-driven sub-agent work, **prefer `codex`** (Zed's adapter):
-
-- Faster: ~8.5s vs ~14.8s to first reply on the same Ollama model
-- Terser: model emits the answer directly without thinking preamble
-- Most-tested in our fork: explicit `CODEX_ACP_THINKING_ALIASES` etc. in `extensions/acpx/src/runtime.ts`
-- Simpler env: just `OPENAI_BASE_URL` + `OPENAI_API_KEY=ollama`, no Anthropic header gymnastics
-- Capability surface advertised in initialize is similar to claude's — same `session/set_mode`-not-advertised story
-
-Suggested ACP config block for `~/.openclaw/openclaw.json` (replaces the previous `claude` agent override):
+Write `~/.pi/agent/models.json`:
 
 ```json
 {
-  "plugins": {
-    "entries": {
-      "acpx": {
-        "enabled": true,
-        "config": {
-          "permissionMode": "approve-all",
-          "nonInteractivePermissions": "fail",
-          "timeoutSeconds": 120,
-          "agents": {
-            "codex": {
-              "command": "/usr/bin/env OPENAI_BASE_URL=http://127.0.0.1:11434/v1 OPENAI_API_KEY=ollama OPENAI_MODEL=deepseek-v4-pro:cloud npx -y @zed-industries/codex-acp"
-            }
-          }
-        }
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "models": [
+        { "id": "deepseek-v4-pro:cloud" }
+      ],
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
       }
     }
   }
 }
 ```
 
-Then call `sessions_spawn` with `agentId: "codex"` instead of `agentId: "claude"`.
+Write `~/.pi/agent/settings.json`:
+
+```json
+{ "model": "ollama/deepseek-v4-pro:cloud" }
+```
+
+The `compat` block disables `developer`-role system prompts and `reasoning_effort` — neither is implemented by Ollama's OpenAI-compat shim. `apiKey` is required by pi's schema but Ollama ignores the value, so any string works.
+
+After that, `npx -y pi-acp` runs with no further env vars (pi reads its config from `~/.pi/agent/`).
+
+Result of the live test:
+
+```json
+{
+  "ok": true,
+  "durationMs": 5561,
+  "sessionId": "019e055a-e8ea-72a8-a04d-e6278684218a",
+  "modelOutput": "pi v0.73.1\n---\n\n## Skills\n- /root/.pi/agent/skills/find-skills/SKILL.md\n- ...\nThe user wants me to reply with just the single word \"PONG\" and nothing else. PONG",
+  "chunkCount": 28
+}
+```
+
+Adapter capabilities (from `initialize`):
+
+```json
+{
+  "loadSession": true,
+  "mcpCapabilities": { "http": false, "sse": false },
+  "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
+  "sessionCapabilities": { "list": {} }
+}
+```
+
+The `Skills` section in the model output is pi loading its skill registry on startup — a feature, not a bug, and skips on a per-session basis once the session starts.
+
+OpenClaw integration note: like claude and codex, pi-acp does not advertise `session/set_mode` in its capabilities, so the same Path A constraint applies (don't pass `mode` to `sessions_spawn`).
+
+### Updated recommendation (post-pi correction)
+
+For new ACP-driven sub-agent work, **prefer `pi`** as the default — it's the fastest and lightest of the three with no install-time auth ceremony, and the underlying `pi` agent has competitive coding-agent affordances (read/edit/bash/write/diffs/skills) per its README.
+
+Fallback ordering for new sub-agent work:
+
+1. **`pi`** — 5.5s first PONG. Smallest binary, fastest startup, no Anthropic/OpenAI key gymnastics.
+2. **`codex`** — 8.5s. Most-tested in our fork; has special-case handling in `extensions/acpx/src/runtime.ts` for thinking effort, model prefix normalization, etc.
+3. **`claude`** — 14.8s. Slowest but full Claude Code agent loop semantics.
+
+All three are now configured side-by-side in `~/.openclaw/openclaw.json` under `plugins.entries.acpx.config.agents.{claude,codex,pi}`. Pick at spawn time via the `agentId` parameter:
+
+```ts
+sessions_spawn({ runtime: "acp", agentId: "pi", /* no mode! */ ... })
+```
 
 ### Open question — Path A through the gateway
 
