@@ -1,36 +1,3 @@
-# ACP Claude Code + Ollama Integration
-
-## Date
-2026-05-08 (rewrite — supersedes the 2026-05-07 version)
-
-## Author
-Gobling (Ariel's assistant), corrected after the 2026-05-07/08 ACP debugging session.
-
-## Context
-Ariel wanted Claude Code to run as an ACP harness backed by Ollama models (`kimi-k2.6:cloud` initially, then `deepseek-v4-pro:cloud`). The 2026-05-07 version of this doc said `ollama launch claude --model X --yes` was the correct ACP command. **That was wrong.** This rewrite documents what actually works and why the previous instructions produced 17-minute hung `sessions_spawn` calls.
-
-## What the Previous Version Got Wrong
-
-The previous instruction was:
-```json
-"claude": { "command": "ollama launch claude --model kimi-k2.6:cloud --yes" }
-```
-
-This runs interactive Claude Code (the ELF binary at `/root/.local/bin/claude`). **Interactive Claude Code does not speak the ACP wire protocol on stdio.** It reads stdin as user chat messages and replies conversationally. When acpx pipes JSON-RPC `initialize` into stdin, Claude Code treats it as a question:
-
-```
-$ echo '{"jsonrpc":"2.0","id":1,"method":"initialize",...}' \
-    | ollama launch claude --model deepseek-v4-pro:cloud --yes
-
-Launching Claude Code with deepseek-v4-pro:cloud...
-I see you're sending a JSON-RPC `initialize` request — this looks like a
-Model Context Protocol (MCP) or Language Server Protocol handshake. I'm
-Claude Code, an interactive CLI agent, not an MCP/LSP server. I don't
-speak the LSP/MCP wire protocol directly.
-```
-
-That's why `sessions_spawn` hung for 17+ minutes with kimi-k2.6:cloud — the model never produced its conversational reply (slow + unstable cloud routing). With deepseek-v4-pro:cloud the chat reply came fast, but ACP was still broken: acpx kept waiting for a JSON-RPC `result`, the subprocess kept producing natural-language sentences. Wrong protocol, wrong layer.
-
 ## The Correct Approach
 
 Two pieces compose:
@@ -210,3 +177,227 @@ If a session hangs, see `dev-mode/rescue.md` Pattern E (single-session model-cal
 - Anthropic Agent SDK overview: https://code.claude.com/docs/en/agent-sdk/overview
 - openclaw acpx plugin: https://github.com/openclaw/acpx
 - Local fork rescue patterns: `/opt/openclaw-dev-mode/dev-mode/rescue.md` (Pattern E)
+
+---
+
+## End-to-end smoke test results (2026-05-08)
+
+Three ACP adapters tested directly against Ollama (not through OpenClaw `sessions_spawn`) using a Node test harness that runs the full ACP wire-protocol sequence: `initialize` → `session/new` → `session/prompt`. The prompt is *"Reply with just the single word PONG and nothing else"*. The harness watches stdout for the model's reply and reports the result, timing, and adapter capabilities.
+
+The harness lives at `/tmp/acp-pong.mjs` on the VPS. Invoke as:
+
+```
+env <env-vars> node /tmp/acp-pong.mjs <agent-command...>
+```
+
+The agent commands come from acpx's built-in registry (`extensions/acpx/node_modules/acpx/skills/acpx/SKILL.md` in our fork — also visible upstream at `openclaw/acpx`).
+
+### Agent: `claude` → `npx -y @agentclientprotocol/claude-agent-acp`
+
+**Status: WORKS.** PONG received end-to-end via Ollama.
+
+Env required:
+```
+ANTHROPIC_BASE_URL=http://127.0.0.1:11434
+ANTHROPIC_AUTH_TOKEN=ollama
+ANTHROPIC_MODEL=deepseek-v4-pro:cloud
+```
+
+Result: `ok: true`, `durationMs: 14861`, `chunkCount: 27`. Model output included reasoning ("The user wants me to reply with just \"PONG\" and nothing else.") followed by `PONG`.
+
+Adapter capabilities (from `initialize` response):
+
+```json
+{
+  "_meta": { "claudeCode": { "promptQueueing": true } },
+  "promptCapabilities": { "image": true, "embeddedContext": true },
+  "mcpCapabilities": { "http": true, "sse": true },
+  "loadSession": true,
+  "sessionCapabilities": { "fork": {}, "list": {}, "resume": {}, "close": {} }
+}
+```
+
+OpenClaw integration note: this adapter does NOT advertise `session/set_mode` in its capabilities (no `controls` field at all in the initialize response). OpenClaw's main agent must call `sessions_spawn` without a `mode` parameter, otherwise `src/acp/control-plane/manager.runtime-controls.ts` throws `AcpRuntimeError: Could not apply ACP runtime options before turn execution.` before the prompt is ever sent. Same applies to the `codex` adapter below.
+
+### Agent: `codex` → `npx @zed-industries/codex-acp`
+
+**Status: WORKS.** PONG received end-to-end via Ollama. Fastest and terstest of the three.
+
+Env required:
+```
+OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+OPENAI_API_KEY=ollama
+OPENAI_MODEL=deepseek-v4-pro:cloud
+```
+
+Result: `ok: true`, `durationMs: 8517`, `chunkCount: 7`. Model output: `PONG` — no reasoning preamble, no extra text. Roughly 2x faster than claude on the same model.
+
+Adapter capabilities:
+
+```json
+{
+  "loadSession": true,
+  "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true },
+  "mcpCapabilities": { "http": true, "sse": false },
+  "sessionCapabilities": { "list": {}, "close": {} },
+  "auth": { "logout": {} }
+}
+```
+
+This is Zed's adapter that wraps the OpenAI Codex CLI via stdio and routes underlying chat completions to whatever `OPENAI_BASE_URL` points at. Because Ollama serves an OpenAI-compatible `/v1/chat/completions` endpoint at `http://127.0.0.1:11434/v1`, no protocol translation is needed — codex-acp talks to it like it would talk to api.openai.com.
+
+OpenClaw fork already has special-case handling for the `codex` agent ID in `extensions/acpx/src/runtime.ts`: `CODEX_ACP_THINKING_ALIASES` (maps OpenClaw thought-level values to codex-acp `reasoning_effort`), `CODEX_ACP_REASONING_EFFORTS`, and OpenAI-prefix model normalization. None of the other adapters get that treatment — codex is the most thoroughly integrated ACP path in our fork.
+
+### Agent: `pi` → `npx pi-acp`
+
+**Status: DOES NOT WORK with Ollama.** Wrong product.
+
+Env: tried with no overrides.
+
+Result: `ok: false`, `durationMs: 1807`, error: `Authentication required: Configure an API key or log in with an OAuth provider.`
+
+The `pi-acp` npm package is **not** OpenClaw's embedded PI runtime — it is a separate product (Inflection's Pi assistant) that requires its own API key or OAuth. It cannot be redirected to Ollama or any other model backend.
+
+The acpx alias `pi → npx pi-acp` exists for the original Pi product. If you want "OpenClaw's own runtime served as an ACP harness" instead, the right alias is `openclaw → openclaw acp` — that loops back to the local OpenClaw gateway and inherits whichever models the gateway is configured to use (already Ollama in this setup, no extra config). Untested in this round but logically the cleaner OpenClaw-native path.
+
+### Recommendation
+
+For new ACP-driven sub-agent work, **prefer `codex`** (Zed's adapter):
+
+- Faster: ~8.5s vs ~14.8s to first reply on the same Ollama model
+- Terser: model emits the answer directly without thinking preamble
+- Most-tested in our fork: explicit `CODEX_ACP_THINKING_ALIASES` etc. in `extensions/acpx/src/runtime.ts`
+- Simpler env: just `OPENAI_BASE_URL` + `OPENAI_API_KEY=ollama`, no Anthropic header gymnastics
+- Capability surface advertised in initialize is similar to claude's — same `session/set_mode`-not-advertised story
+
+Suggested ACP config block for `~/.openclaw/openclaw.json` (replaces the previous `claude` agent override):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "acpx": {
+        "enabled": true,
+        "config": {
+          "permissionMode": "approve-all",
+          "nonInteractivePermissions": "fail",
+          "timeoutSeconds": 120,
+          "agents": {
+            "codex": {
+              "command": "/usr/bin/env OPENAI_BASE_URL=http://127.0.0.1:11434/v1 OPENAI_API_KEY=ollama OPENAI_MODEL=deepseek-v4-pro:cloud npx -y @zed-industries/codex-acp"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Then call `sessions_spawn` with `agentId: "codex"` instead of `agentId: "claude"`.
+
+### Open question — Path A through the gateway
+
+Both adapters that worked (claude, codex) omit the `session/set_mode` control from their advertised capabilities. OpenClaw will throw `AcpRuntimeError: Could not apply ACP runtime options before turn execution.` whenever `sessions_spawn` is called with a non-empty `mode`. The proven-to-work path is to call `sessions_spawn` **without** a `mode` parameter — the agent's prompt or the cron payload should not set it.
+
+This was not yet verified end-to-end through the OpenClaw gateway in this round (`openclaw message send` is outbound-only and bypasses the auto-reply pipeline; an inbound test message from the user is needed). The adapter side is fully proven via the direct-pipe smoke tests above.
+
+### Reproduction
+
+The test harness `/tmp/acp-pong.mjs`:
+
+```js
+import { spawn } from "node:child_process";
+
+const args = process.argv.slice(2);
+const child = spawn(args[0], args.slice(1), { stdio: ["pipe", "pipe", "pipe"], env: process.env });
+
+const responses = new Map();
+const allChunks = [];
+let buffer = "";
+
+child.stdout.on("data", (data) => {
+  buffer += data.toString();
+  const lines = buffer.split("\n");
+  buffer = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const msg = JSON.parse(line);
+      allChunks.push(msg);
+      if (msg.id !== undefined && responses.has(msg.id)) {
+        const resolve = responses.get(msg.id);
+        responses.delete(msg.id);
+        resolve(msg);
+      }
+    } catch {}
+  }
+});
+
+const send = (msg) => new Promise((resolve) => {
+  if (msg.id !== undefined) responses.set(msg.id, resolve);
+  child.stdin.write(JSON.stringify(msg) + "\n");
+  if (msg.id === undefined) resolve();
+});
+
+const timed = (p, ms, label) => Promise.race([
+  p,
+  new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout`)), ms)),
+]);
+
+const result = { ok: false, sessionId: null, modelOutput: "", chunkCount: 0 };
+
+try {
+  const initResp = await timed(send({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: "pong-test", version: "1.0" } },
+  }), 20000, "initialize");
+  if (initResp.error) throw new Error(initResp.error.message);
+
+  const sessResp = await timed(send({
+    jsonrpc: "2.0", id: 2, method: "session/new",
+    params: { cwd: "/tmp", mcpServers: [] },
+  }), 30000, "session/new");
+  if (sessResp.error) throw new Error(sessResp.error.message);
+  result.sessionId = sessResp.result?.sessionId;
+
+  await timed(send({
+    jsonrpc: "2.0", id: 3, method: "session/prompt",
+    params: { sessionId: result.sessionId, prompt: [{ type: "text", text: "Reply with just the single word PONG and nothing else." }] },
+  }), 120000, "session/prompt");
+
+  let collected = "";
+  for (const c of allChunks) {
+    const tryGetText = (obj) => {
+      if (!obj || typeof obj !== "object") return;
+      if (typeof obj.text === "string") collected += obj.text + " ";
+      if (Array.isArray(obj)) obj.forEach(tryGetText);
+      else for (const v of Object.values(obj)) tryGetText(v);
+    };
+    tryGetText(c);
+  }
+  result.modelOutput = collected.slice(0, 600);
+  result.ok = true;
+} catch (e) {
+  result.error = e.message;
+}
+result.chunkCount = allChunks.length;
+console.log(JSON.stringify(result, null, 2));
+child.stdin.end();
+child.kill("SIGTERM");
+```
+
+Run any of:
+
+```bash
+# claude
+env ANTHROPIC_BASE_URL=http://127.0.0.1:11434 ANTHROPIC_AUTH_TOKEN=ollama ANTHROPIC_MODEL=deepseek-v4-pro:cloud \
+  node /tmp/acp-pong.mjs npx -y @agentclientprotocol/claude-agent-acp
+
+# codex (recommended)
+env OPENAI_BASE_URL=http://127.0.0.1:11434/v1 OPENAI_API_KEY=ollama OPENAI_MODEL=deepseek-v4-pro:cloud \
+  node /tmp/acp-pong.mjs npx -y @zed-industries/codex-acp
+
+# pi (will fail unless you have inflection.ai auth)
+node /tmp/acp-pong.mjs npx -y pi-acp
+```
