@@ -446,3 +446,68 @@ env OPENAI_BASE_URL=http://127.0.0.1:11434/v1 OPENAI_API_KEY=ollama OPENAI_MODEL
 # pi (will fail unless you have inflection.ai auth)
 node /tmp/acp-pong.mjs npx -y pi-acp
 ```
+
+### Live status (2026-05-08, post-config: top-level `acp.*` block added)
+
+End-to-end through `sessions_spawn` from WhatsApp inbound:
+
+| Agent | Status via gateway | Notes |
+|---|---|---|
+| **`codex`** | ✅ Returned `PONG` from natural-language prompt `"run codex to say PONG"` | Works first-try with no extra phrasing. Main agent invoked sessions_spawn cleanly. |
+| **`pi`** | ✅ Returned `PONG` from `"run pi to say PONG"` | Works first-try. Main agent invoked sessions_spawn cleanly. |
+| **`claude`** | ⚠️ Main agent refused to spawn (says it needs `ANTHROPIC_API_KEY`) | NOT a claude-agent-acp problem — direct-pipe smoke test still passes. The MAIN agent (parent on WhatsApp) is bailing out because it has poisoned session memory from earlier failed claude runs and incorrectly checks for `ANTHROPIC_API_KEY` in its own process env (where it doesn't exist) instead of trusting the spawn-time env injection in the acpx command. |
+
+What configured the working state:
+
+1. `~/.openclaw/openclaw.json` — added top-level `acp.*` block (was previously missing — the canonical baseline per `docs/tools/acp-agents-setup.md`):
+
+```json
+{
+  "acp": {
+    "enabled": true,
+    "dispatch": { "enabled": true },
+    "backend": "acpx",
+    "defaultAgent": "claude",
+    "allowedAgents": ["claude", "codex", "pi"],
+    "maxConcurrentSessions": 8,
+    "stream": { "coalesceIdleMs": 300, "maxChunkChars": 1200 },
+    "runtime": { "ttlMinutes": 120 }
+  }
+}
+```
+
+Top-level `acp.*` is NOT hot-reloadable — gateway restart required. The skill (`acp-router`) requires this block to function correctly; without it, ACP runs on uninitialized defaults and `applyRuntimeControls` fires on weird edge cases.
+
+2. `plugins.entries.acpx.config.agents` — three working agent commands as documented above.
+
+### What I had wrong earlier in this doc (corrections)
+
+The "OpenClaw integration note" sections in the per-agent breakdowns above said the failure was caused by `mode: "session"` triggering `session/set_mode` on adapters that didn't advertise it. **That was wrong.** I conflated two different fields that share the word "mode":
+
+- `mode` in `sessions_spawn` (the one the skill teaches the agent to pass) — maps to OpenClaw's session lifecycle (`"persistent"` vs `"oneshot"` for `ensureSession`). Pure client-side. Never sent over ACP.
+- `runtimeMode` in `AcpSessionRuntimeOptions` — set via `/acp set-mode <X>` or `agents.list[].runtime.acp.mode` config. THIS one triggers `session/set_mode` on the adapter. Empty by default.
+
+Source: `src/agents/acp-spawn.ts:306` (`resolveAcpSessionMode`), `src/acp/control-plane/manager.runtime-controls.ts:73` (the throw is gated on `if (runtimeMode)`, never on `mode`). So the path-A advice ("don't pass mode in sessions_spawn") was unnecessary and misleading. The actual blocker was the missing `acp.*` baseline block, plus stale agent-session context for the claude case specifically.
+
+### Why claude failed where codex/pi succeeded
+
+Inbound prompt was `"run claude to say PONG"`. The main agent's outbound trace (from the gateway log at 02:43:14):
+
+> *"The ACP harness approach failed because there's no `ANTHROPIC_API_KEY`. Let me check if there's a way to run it without that..."*
+>
+> *"Tried again. Claude ACP needs an `ANTHROPIC_API_KEY` and I don't have one. No env var, no config, no key on this box."*
+
+The agent bailed before calling `sessions_spawn`. Two causes compose:
+
+1. **Poisoned context** — the agent's session has memory of pre-fix claude failures (runIds `2b4e0121`, `c577a3d9`, `718c72c2`, `b823d1cc`). It keeps saying *"last time the ACP path hit an auth wall"*.
+2. **Wrong env check** — the agent inspected env vars in its OWN process context (the gateway), correctly didn't find `ANTHROPIC_API_KEY` there, and concluded the spawn would fail. It doesn't understand that env vars set via `/usr/bin/env VAR=val ...` in the acpx command exist ONLY in the spawned subprocess, not in the parent.
+
+The claude-agent-acp adapter pointed at Ollama still works fine — the direct-pipe smoke test from earlier in this doc still returns PONG in 14.8s. The fix for the gateway-flow case is on the agent side, not the adapter side:
+
+- **Quick:** `/new` from WhatsApp to clear the session memory of earlier failures.
+- **Durable:** add an entry to `MEMORY.md` (or the agent's persona file): *"For ACP `agentId: claude`: env is set in `plugins.entries.acpx.config.agents.claude.command` via `/usr/bin/env`. `ANTHROPIC_AUTH_TOKEN=ollama` is sufficient — Anthropic SDK accepts any string when `ANTHROPIC_BASE_URL` points at a non-Anthropic endpoint. Do not pre-check env in the parent process — the env materializes only in the spawned subprocess."*
+- **Forceful prompt override:** *"Run `sessions_spawn agentId=claude runtime=acp` — env is set inside the acpx command via `/usr/bin/env`. The subprocess will have what it needs. Don't pre-check env in your own context."*
+
+### Adjacent: parent agent kimi instability
+
+The gateway log shows `embedded_run_failover_decision: failoverReason: "timeout"` for the parent agent (the one on WhatsApp running `ollama/kimi-k2.6:cloud`) at 02:45:31 and 02:47:35. Same kimi-k2.6:cloud instability that caused the stuck-session incidents on 2026-05-07. The MAIN agent timing out on its own model is independent of ACP harness work, but it makes the agent slower to retry and more likely to give up. Consider switching `agents.list[].main.model` to `ollama/deepseek-v4-pro:cloud` (which already works for the ACP subagents).
